@@ -1,85 +1,159 @@
-import selection from "../config/selection.js";
-import AutoPick from "../db/models/AutoPick.js";
-import { NewsIngestorService } from "./NewsIngestorService.js";
-import { gradeArticle } from "./SentimentService.js";
-import { getScores as getTechScores } from "./TechFactorService.js";
-import { combine } from "./CombineService.js";
+import { getCoreUniverse } from "../integrations/kite/universe.js";
+import { getTechScoresForSymbol } from "./TechFactorService.js";
+import { MongoClient } from "mongodb";
+import { shortlistUniverse } from "./FastFilterService.js";
+import { isMarketOpenIST } from "../utils/marketHours.js";
 
-const news = new NewsIngestorService();
+const HARD_GATES = {
+  minAvg1mVol: 200000, // liquidity
+  maxSpreadPct: 0.0035, // 0.35%
+  maxATRPct: 0.05, // 5%
+  minPrice: 20,
+};
 
-function passFilters(tech, filters){
-  // Simple liquidity-only filter for v1
-  return (tech && (tech.liqScore ?? 0) > 0.2);
-}
-function aggregateLLM(graded){
-  if (!graded.length) return { bullishness:0.5, relevance:0.4, catalyst_strength:0.3, freshness_hours:48, risk_flags:[], rationale:"No fresh news; using defaults." };
-  const top = [...graded].sort((a,b)=> (b.catalyst_strength||0)-(a.catalyst_strength||0)).slice(0,3);
-  const avg = k => top.reduce((s,x)=>s+(x[k]||0),0)/top.length;
-  return {
-    bullishness:avg("bullishness"),
-    relevance:avg("relevance"),
-    catalyst_strength:avg("catalyst_strength"),
-    freshness_hours:avg("freshness_hours"),
-    risk_flags:[...new Set(top.flatMap(x=>x.risk_flags||[]))],
-    rationale: top[0]?.rationale || ""
-  };
-}
+export async function runAutoPick({ debug = false } = {}) {
+  const universe = await getCoreUniverse();
 
-export class AutoPickerService {
-  async run(runType="preopen") {
-    const { watchlist, filters, weights } = selection;
+  const live = isMarketOpenIST(); // true during 09:15–15:30 IST
 
-    await news.ingestForSymbols(watchlist, 48); // non-blocking later
+  // Stage-1: require depth only when live
+  const short = await shortlistUniverse(universe, {
+    minPrice: HARD_GATES.minPrice,
+    maxSpreadPct: 0.006,
+    preferPositiveGap: true,
+    limit: live ? 80 : 120, // off-hours keep a slightly larger shortlist
+    requireDepth: live,
+  });
 
-    const candidates = [];
-    for (const symbol of watchlist) {
-      if (filters.banList.includes(symbol)) continue;
+  const results = await scoreUniverse(short, 5);
 
-      const items = await news.latestForSymbol(symbol, 36);
-      const graded = [];
-      for (const a of items) {
-        try {
-          const g = await gradeArticle({ symbol, headline: a.headline, body: a.body, publishedAt: a.ts?.toISOString?.() });
-          graded.push({ ...g, article: { articleId: String(a._id), url: a.url, headline: a.headline } });
-        } catch { /* ignore single-article errors */ }
-      }
-      const llmAgg = aggregateLLM(graded);
-      const tech = await getTechScores(symbol);
-      if (!passFilters(tech, filters)) continue;
-
-      const funda = { score: 0.5 }; // placeholder
-      const combined = combine({ llm: llmAgg, tech, funda, weights });
-
-      const topFactors = [
-        llmAgg.catalyst_strength > 0.6 ? "Strong catalyst" : "Weak catalyst",
-        `Momentum:${(tech.momScore*100|0)}%`,
-        `Liquidity:${(tech.liqScore*100|0)}%`
-      ];
-      candidates.push({ symbol, total: combined.total, breakdown: combined.breakdown, topFactors, articles: graded.map(g=>g.article) });
-    }
-
-    if (!candidates.length) throw new Error("No candidates passed filters");
-
-    candidates.sort((a,b)=> b.total - a.total);
-    const pick = candidates[0];
-
-    const today = new Date().toISOString().slice(0,10);
-    const doc = await AutoPick.create({
-      date: today,
-      runType,
-      symbol: pick.symbol,
-      totalScore: pick.total,
-      breakdown: pick.breakdown,
-      inputs: { topFactors: pick.topFactors, articles: pick.articles },
-      tieBreakers: [],
-      decidedAt: new Date()
-    });
-
-    return doc;
+  const passed = [];
+  const failed = [];
+  for (const r of results) {
+    if (!r) continue;
+    if (passGates(r, live)) passed.push(r);
+    else
+      failed.push({
+        symbol: r.symbol,
+        name: r.name,
+        reasons: gateReasons(r, live),
+      });
   }
 
-  async latest() {
-    const today = new Date().toISOString().slice(0,10);
-    return await AutoPick.findOne({ date: today }).sort({ decidedAt: -1 });
+  const ranked = passed.sort((a, b) => b.scores.techTotal - a.scores.techTotal);
+  const top5 = ranked.slice(0, 5);
+  const pick = ranked[0] || null;
+
+  const doc = {
+    ts: new Date(),
+    pick,
+    top5,
+    universeSize: universe.length,
+    shortlisted: short.map((x) => ({ symbol: x.symbol, name: x.name })),
+    filteredSize: passed.length,
+    rules: { HARD_GATES, live },
+  };
+
+  await savePick(doc);
+
+  if (debug) {
+    doc.considered = results.filter(Boolean).map((r) => ({
+      symbol: r.symbol,
+      name: r.name,
+      techTotal: r.scores.techTotal,
+    }));
+    doc.filteredOut = failed;
+  } else {
+    doc.considered = short.map((s) => ({ symbol: s.symbol, name: s.name }));
+  }
+
+  return doc;
+}
+
+export async function getLatestPick() {
+  const uri = process.env.MONGO_URI;
+  const dbName = process.env.DB_NAME || "scanner_app";
+  const client = new MongoClient(uri, { ignoreUndefined: true });
+  try {
+    await client.connect();
+    const db = client.db(dbName);
+    const row = await db
+      .collection("auto_picks")
+      .find()
+      .sort({ ts: -1 })
+      .limit(1)
+      .toArray();
+    return row[0] || null;
+  } finally {
+    try {
+      await client.close();
+    } catch {}
+  }
+}
+
+// ---- helpers ----
+function passGates(r, live = true) {
+  const priceOk = (r.last || 0) >= HARD_GATES.minPrice;
+  const volOk = (r.avg1mVol || 0) >= HARD_GATES.minAvg1mVol;
+  const atrOk = (r.atrPct || 0) <= HARD_GATES.maxATRPct;
+  const spreadOk = live ? (r.spreadPct || 1) <= HARD_GATES.maxSpreadPct : true;
+  return priceOk && volOk && atrOk && spreadOk;
+}
+
+function gateReasons(r, live = true) {
+  const reasons = [];
+  if ((r.last || 0) < HARD_GATES.minPrice)
+    reasons.push(`price<₹${HARD_GATES.minPrice}`);
+  if ((r.avg1mVol || 0) < HARD_GATES.minAvg1mVol)
+    reasons.push(`avg1mVol<${HARD_GATES.minAvg1mVol}`);
+  if ((r.atrPct || 0) > HARD_GATES.maxATRPct)
+    reasons.push(`atr%>${(HARD_GATES.maxATRPct * 100).toFixed(1)}%`);
+  if (live && (r.spreadPct || 1) > HARD_GATES.maxSpreadPct)
+    reasons.push(`spread>${(HARD_GATES.maxSpreadPct * 100).toFixed(2)}%`);
+  return reasons;
+}
+
+async function scoreUniverse(universe, concurrency = 5) {
+  const out = [];
+  let i = 0;
+  async function worker() {
+    while (i < universe.length) {
+      const idx = i++;
+      const row = universe[idx];
+      try {
+        const res = await getTechScoresForSymbol(row);
+        out.push(res);
+      } catch (_) {
+        /* ignore per-symbol errors */
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  return out;
+}
+
+async function savePick(doc) {
+  const uri = process.env.MONGO_URI;
+  if (!uri) return;
+  const dbName = process.env.DB_NAME || "scanner_app";
+  const client = new MongoClient(uri, { ignoreUndefined: true });
+  try {
+    await client.connect();
+    const db = client.db(dbName);
+    await db.collection("auto_picks").insertOne(doc);
+  } finally {
+    try {
+      await client.close();
+    } catch {}
+  }
+}
+
+/** Wrapper class so existing imports keep working */
+export class AutoPickerService {
+  static async run(opts) {
+    return runAutoPick(opts);
+  }
+  static async getLatest() {
+    return getLatestPick();
   }
 }
