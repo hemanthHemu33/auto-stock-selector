@@ -1,8 +1,13 @@
 import { Router } from "express";
-import { runNow, latest } from "../controllers/AutoPickController.js";
-const router = Router();
+import {
+  runPick,
+  latestPick,
+  latestTop,
+} from "../controllers/AutoPickController.js";
 
-router.post("/run", runNow);
-router.get("/latest", latest);
-
-export default router;
+const r = Router();
+r.post("/run", runPick);
+r.get("/run", runPick); // optional GET alias
+r.get("/latest", latestPick);
+r.get("/top", latestTop); // <-- this one
+export default r;
