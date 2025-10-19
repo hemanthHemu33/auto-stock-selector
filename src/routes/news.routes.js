@@ -9,9 +9,11 @@ import { getDb } from "../db/mongo.js";
 import { mapTextToSymbols } from "../news/mapper.js";
 import { RSS_SOURCES } from "../news/sources.js";
 import { fetchRSSFeed } from "../news/rss.js";
-import { buildNewsCandidates } from "../news/candidates.js";
+// import { buildNewsCandidates } from "../news/candidates.js";
 import { POLICY } from "../config/policy.js";
 import { toIST } from "../utils/time.js";
+import { buildNewsCandidates } from "../news/candidates.js";
+import { isLLMEnabled } from "../integrations/openai/client.js";
 const r = Router();
 
 /**
@@ -269,4 +271,27 @@ r.get("/candidates", async (req, res, next) => {
   }
 });
 
+// GET /api/news/candidates?windowMin=120&limit=40
+r.get("/candidates", async (req, res, next) => {
+  try {
+    const windowMin = Number(req.query.windowMin || 120);
+    const limit = Number(req.query.limit || 40);
+    const rows = await buildNewsCandidates({ windowMin, limit });
+    res.json({
+      ok: true,
+      live: isMarketOpenIST(),
+      tz: "Asia/Kolkata",
+      rows,
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+r.get("/llm-status", (_req, res) => {
+  res.json({
+    ok: true,
+    enabled: isLLMEnabled(),
+    model: (process.env.LLM_MODEL || "gpt-4.1-mini").trim(),
+  });
+});
 export default r;

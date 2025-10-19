@@ -37,6 +37,19 @@ async function recentSymbolCount(db, symbol, sinceISO) {
     .countDocuments({ symbol, ts: { $gte: sinceISO } });
 }
 
+function buildReasons({ srcQ, cat, fresh, spec, novelty, rpen, minSourcesOK }) {
+  const reasons = [];
+  reasons.push(`srcQ:${srcQ.toFixed(2)}`);
+  reasons.push(
+    `catalyst:${cat.catalyst}(${cat.direction},${cat.impact.toFixed(2)})`
+  );
+  reasons.push(`fresh:${fresh.toFixed(2)}`);
+  reasons.push(`spec:${spec.toFixed(2)}`);
+  reasons.push(`novel:${novelty.toFixed(2)}`);
+  if (rpen > 0) reasons.push(`rumor_penalty:${rpen.toFixed(2)}`);
+  if (!minSourcesOK) reasons.push("min_sources_not_met");
+  return reasons;
+}
 export async function buildNewsCandidates({
   windowMin = POLICY.NEWS_WINDOW_MIN,
   limit = POLICY.NEWS_TOPN,
@@ -82,23 +95,23 @@ export async function buildNewsCandidates({
   const clusters = clusterEvents(ev, { windowMin, simThr: 0.84 });
 
   // score clusters
-  const out = [];
+  const scored = [];
   for (const c of clusters) {
     const last = c.lastTs;
-    const hostWeights = c.sources.map((h) => sourceWeight(h));
+
+    const hostWeights = (c.sources || []).map((h) => sourceWeight(h));
     const srcQ = hostWeights.length
       ? hostWeights.reduce((a, b) => a + b, 0) / hostWeights.length
       : 0.6;
 
-    // catalyst on the cluster sample (or the most recent)
-    const headline = c.articles[0] || c.sample;
+    // catalyst on cluster sample (or most recent)
+    const headline = c.articles?.[0] || c.sample || { title: "", url: "" };
     const cat = await tagCatalyst({ title: headline.title, description: "" });
 
     const fresh = timeDecayScore(last, 120); // 2h half-life for the cluster
     const spec = specificityScore(c);
 
     // novelty: fewer same-symbol clusters in this window → higher novelty
-    // simple proxy: inverse of cluster count in window (we don't have cluster table yet)
     const sameCount = clusters.filter((x) => x.symbol === c.symbol).length;
     const novelty = sameCount > 0 ? Math.max(0, 1 - (sameCount - 1) / 5) : 1;
 
@@ -107,8 +120,8 @@ export async function buildNewsCandidates({
 
     // guardrail: min sources unless official
     const minSourcesOK =
-      isOfficial(c.sources[0]) ||
-      new Set(c.sources).size >= POLICY.GUARDRAILS.minSourceCount;
+      (c.sources && isOfficial(c.sources[0])) ||
+      new Set(c.sources || []).size >= POLICY.GUARDRAILS.minSourceCount;
 
     const w = POLICY.NEWS_SCORE_WEIGHTS;
     let score =
@@ -120,14 +133,14 @@ export async function buildNewsCandidates({
       w.specificity * spec +
       w.novelty * novelty;
 
-    score = score - rpen; // rumor penalty
+    score -= rpen;
 
     const candidate = {
       symbol: c.symbol,
       score,
       lastTs: last,
       hits: c.hits,
-      sources: c.sources,
+      sources: c.sources || [],
       catalyst: cat.catalyst,
       direction: cat.direction,
       impact: cat.impact,
@@ -147,13 +160,12 @@ export async function buildNewsCandidates({
         rpen,
         minSourcesOK,
       }),
-      _debug: { titles: c.titles.slice(0, 3) },
+      _debug: { titles: (c.titles || []).slice(0, 3) },
     };
 
-    if (minSourcesOK) out.push(candidate);
+    if (minSourcesOK) scored.push(candidate);
   }
 
-  // cooldown & sector diversity pruning (optional, sector if available)
   // cooldown: drop symbols picked very recently
   const picksSince = new Date(
     Date.now() - POLICY.GUARDRAILS.cooldownMin * 60000
@@ -163,30 +175,36 @@ export async function buildNewsCandidates({
     .find({ ts: { $gte: picksSince } })
     .project({ "pick.symbol": 1, "top5.symbol": 1 })
     .toArray();
+
   const cooled = new Set();
   for (const p of recentPicks) {
     if (p.pick?.symbol) cooled.add(p.pick.symbol);
     for (const t of p.top5 || []) cooled.add(t.symbol);
   }
-  const afterCooldown = out.filter((x) => !cooled.has(x.symbol));
 
-  // sort & cap
-  afterCooldown.sort((a, b) => b.score - a.score);
-  const top = afterCooldown.slice(0, limit);
+  const afterCooldown = scored.filter((x) => !cooled.has(x.symbol));
 
-  return top;
-}
+  // sector diversity (optional)
+  const perSectorCap = POLICY.GUARDRAILS.sectorDiversityMaxPerSector || 0;
+  let finalList = afterCooldown;
 
-function buildReasons({ srcQ, cat, fresh, spec, novelty, rpen, minSourcesOK }) {
-  const reasons = [];
-  reasons.push(`srcQ:${srcQ.toFixed(2)}`);
-  reasons.push(
-    `catalyst:${cat.catalyst}(${cat.direction},${cat.impact.toFixed(2)})`
-  );
-  reasons.push(`fresh:${fresh.toFixed(2)}`);
-  reasons.push(`spec:${spec.toFixed(2)}`);
-  reasons.push(`novel:${novelty.toFixed(2)}`);
-  if (rpen > 0) reasons.push(`rumor_penalty:${rpen.toFixed(2)}`);
-  if (!minSourcesOK) reasons.push("min_sources_not_met");
-  return reasons;
+  if (perSectorCap > 0) {
+    const bySec = new Map();
+    const diversified = [];
+    // sort once before applying sector cap
+    afterCooldown.sort((a, b) => b.score - a.score);
+    for (const c of afterCooldown) {
+      const sec = getSector(c.symbol);
+      const cnt = bySec.get(sec) || 0;
+      if (cnt >= perSectorCap) continue;
+      bySec.set(sec, cnt + 1);
+      diversified.push(c);
+      if (diversified.length >= limit) break;
+    }
+    finalList = diversified;
+  }
+
+  // final sort & cap
+  finalList.sort((a, b) => b.score - a.score);
+  return finalList.slice(0, limit);
 }

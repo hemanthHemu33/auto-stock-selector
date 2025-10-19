@@ -1,15 +1,24 @@
-// src/integrations/openai/client.js
+// FIX: go up two directories to reach src/config/env.js
+import "../../config/env.js";
 import OpenAI from "openai";
 
-let openai = null;
-const key = process.env.OPENAI_API_KEY;
-if (!key) {
-  console.warn(
-    "[openai] OPENAI_API_KEY missing — running in no-LLM fallback mode."
-  );
-} else {
-  openai = new OpenAI({ apiKey: key });
+const KEY = process.env.OPENAI_API_KEY?.trim();
+export const LLM_MODEL = (process.env.LLM_MODEL || "gpt-4.1-mini").trim();
+
+let client = null;
+try {
+  if (KEY) {
+    client = new OpenAI({ apiKey: KEY });
+    console.log(`[openai] enabled model=${LLM_MODEL}`);
+  } else {
+    console.warn(
+      "[openai] OPENAI_API_KEY missing — using rules-only fallbacks"
+    );
+  }
+} catch (e) {
+  console.error("[openai] init failed:", e?.message || e);
+  client = null;
 }
 
-export { openai };
-export const LLM_MODEL = process.env.LLM_MODEL || "gpt-4.1-mini";
+export const openai = client;
+export const isLLMEnabled = () => !!client;
