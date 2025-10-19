@@ -1,10 +1,30 @@
-import mongoose from "mongoose";
+// src/db/mongo.js
+import { MongoClient } from "mongodb";
+
+let client;
+let db;
 
 export async function connectMongo() {
-  const uri =
-    "mongodb+srv://hemanthhemu3399:hemanthhemu3399@cluster0.53r8xqg.mongodb.net/?retryWrites=true&w=majority";
+  const uri = process.env.MONGO_URI;
+  const dbName = process.env.DB_NAME || "scanner_app"; // <- SAME as scanner
   if (!uri) throw new Error("MONGO_URI missing");
-  mongoose.set("strictQuery", true);
-  await mongoose.connect(uri, { dbName: "auto_pick" });
-  console.log("[mongo] connected");
+
+  client = new MongoClient(uri, { ignoreUndefined: true });
+  await client.connect();
+  db = client.db(dbName);
+  console.log(`[mongo] connected db=${dbName}`);
+  return db;
+}
+
+export function getDb() {
+  if (!db) throw new Error("Mongo not connected; call connectMongo() first");
+  return db;
+}
+
+export async function closeMongo() {
+  try {
+    await client?.close();
+  } catch {}
+  client = undefined;
+  db = undefined;
 }

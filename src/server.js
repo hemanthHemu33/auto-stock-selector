@@ -1,6 +1,9 @@
 // src/server.js
 import "./config/env.js";
+import express from "express";
+import { connectMongo } from "./db/mongo.js";
 
+await connectMongo(); // one shared connection for the app
 import { createApp } from "./app.js";
 import { initKiteAccessTokenFromMongo } from "./integrations/kite/tokenFromMongo.js";
 import kiteRoutes from "./routes/kite.routes.js";

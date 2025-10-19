@@ -8,8 +8,8 @@ import autoPickRoutes from "./routes/autoPick.routes.js";
 import healthRoutes from "./routes/health.routes.js";
 import universeRoutes from "./routes/universe.routes.js";
 import pickRoutes from "./routes/pick.routes.js";
-// ...
-
+import newsRoutes from "./routes/news.routes.js";
+import shortlistRoutes from "./routes/shortlist.routes.js";
 export async function createApp() {
   await connectMongo();
 
@@ -19,11 +19,17 @@ export async function createApp() {
   app.use(helmet());
   app.use(morgan("tiny"));
 
-  app.use("/api/auto-pick", autoPickRoutes);
   app.use("/healthz", healthRoutes);
+
+  // F&O PICK APIS
+  app.use("/api/auto-pick", autoPickRoutes);
   app.use("/api/universe", universeRoutes);
   app.use("/api/pick", pickRoutes);
-  app.use("/api/top", autoPickRoutes); // optional alias
+  app.use("/api/top", autoPickRoutes);
+
+  // NEWS APIS
+  app.use("/api/news", newsRoutes);
+  app.use("/api/shortlist", shortlistRoutes);
 
   // Safe global error handler
   app.use((err, req, res, _next) => {

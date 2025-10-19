@@ -1,85 +1,94 @@
 // src/services/FastFilterService.js
-import {
-  getOHLCBatch,
-  getQuoteBatch,
-} from "../integrations/kite/marketData.js";
+import { getKite } from "../integrations/kite/kiteClient.js";
+
+const BATCH = 120;
 
 export async function shortlistUniverse(
   universe,
   {
     minPrice = 20,
-    maxSpreadPct = 0.005, // live-only gate
+    maxSpreadPct = 0.006, // 0.6%
     preferPositiveGap = true,
-    limit = 80,
-    requireDepth = true, // <-- NEW: if false, we don't drop when depth missing
+    limit = 100,
+    requireDepth = false,
   } = {}
 ) {
-  const symbols = universe.map((u) => u.symbol);
-  const [ohlcMap, quoteMap] = await Promise.all([
-    getOHLCBatch(symbols),
-    getQuoteBatch(symbols),
-  ]);
+  if (!Array.isArray(universe) || universe.length === 0) return [];
 
+  const kite = getKite();
+  const instruments = universe.map((u) => u.symbol); // e.g. "NSE:RELIANCE"
+
+  // 1) fetch quotes in batches
+  const quotes = {};
+  for (let i = 0; i < instruments.length; i += BATCH) {
+    const slice = instruments.slice(i, i + BATCH);
+    try {
+      const q = await kite.quote(slice);
+      Object.assign(quotes, q || {});
+    } catch (e) {
+      // swallow per-batch errors to keep best-effort behavior
+    }
+  }
+
+  // 2) build rows with computed fields
   const rows = [];
-  for (const u of universe) {
-    const sym = u.symbol;
-    const o = ohlcMap[sym];
-    const q = quoteMap[sym];
-    if (!o?.ohlc) continue;
-
-    const last = o.last_price ?? o.ohlc?.close ?? null;
-    const openToday = o.ohlc?.open ?? null;
-    const prevClose = o.ohlc?.close ?? null; // Kite OHLC close is prev close
-    if (!isFinite(last) || !isFinite(openToday) || !isFinite(prevClose))
+  const bySym = new Map(universe.map((x) => [x.symbol, x]));
+  for (const sym of instruments) {
+    const q = quotes[sym];
+    if (!q) {
+      if (requireDepth) continue; // need depth/quote when live
+      // no quote; skip silently off-hours
       continue;
-
-    // Depth (may be missing off-hours)
-    const bid = q?.depth?.buy?.[0]?.price;
-    const ask = q?.depth?.sell?.[0]?.price;
-    let spreadPct = null;
-
-    if (isFinite(bid) && isFinite(ask)) {
-      const mid = (bid + ask) / 2;
-      if (!isFinite(mid) || mid <= 0) continue;
-      spreadPct = (ask - bid) / mid;
-    } else if (requireDepth) {
-      // live mode: skip if no depth
-      continue;
-    } else {
-      // off-hours: leave spreadPct=null (we'll skip the spread gate & apply a neutral penalty in ranking)
-      spreadPct = null;
     }
 
-    const gapPct = (openToday - prevClose) / prevClose;
-    const intradayPct = (last - openToday) / openToday;
+    const last = num(q.last_price);
+    if (!isFinite(last) || last < minPrice) continue;
 
-    // quick gates
-    if (last < minPrice) continue;
-    if (preferPositiveGap && gapPct < -0.01) continue;
-    if (requireDepth && spreadPct !== null && spreadPct > maxSpreadPct)
-      continue;
+    const prevClose = num(q.ohlc?.close);
+    const gap = prevClose > 0 ? (last - prevClose) / prevClose : 0;
 
+    // Spread from top-of-book depth (if available)
+    const bestBuy = num(q.depth?.buy?.[0]?.price);
+    const bestSell = num(q.depth?.sell?.[0]?.price);
+    let spreadPct = null;
+    if (isFinite(bestBuy) && isFinite(bestSell) && last > 0) {
+      spreadPct = Math.max(0, bestSell - bestBuy) / last;
+    }
+
+    if (requireDepth) {
+      if (!isFinite(spreadPct)) continue; // need usable depth
+      if (spreadPct > maxSpreadPct) continue;
+    } else {
+      // when depth is missing off-hours, we won't filter by spread
+      if (isFinite(spreadPct) && spreadPct > maxSpreadPct) continue;
+    }
+
+    if (preferPositiveGap && gap < 0) continue;
+
+    const base = bySym.get(sym) || { symbol: sym, name: "" };
     rows.push({
-      symbol: sym,
-      name: u.name,
-      token: u.token,
+      symbol: base.symbol,
+      name: base.name,
       last,
       prevClose,
-      openToday,
-      gapPct,
-      spreadPct,
-      intradayPct,
+      gap,
+      spreadPct: isFinite(spreadPct) ? spreadPct : null,
     });
   }
 
-  // Ranking: if spread is unknown, use a neutral penalty (e.g., 0.004)
+  // 3) sort & cap: highest positive gap first, then tighter spreads
   rows.sort((a, b) => {
-    const sa = a.spreadPct == null ? 0.004 : a.spreadPct;
-    const sb = b.spreadPct == null ? 0.004 : b.spreadPct;
-    const ra = (a.gapPct || 0) + 0.8 * (a.intradayPct || 0) - 2 * sa;
-    const rb = (b.gapPct || 0) + 0.8 * (b.intradayPct || 0) - 2 * sb;
-    return rb - ra;
+    const byGap = (b.gap || 0) - (a.gap || 0);
+    if (byGap !== 0) return byGap;
+    const sa = isFinite(a.spreadPct) ? a.spreadPct : 9e9;
+    const sb = isFinite(b.spreadPct) ? b.spreadPct : 9e9;
+    return sa - sb;
   });
 
-  return rows.slice(0, Math.max(1, limit));
+  return rows.slice(0, limit);
+}
+
+function num(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : NaN;
 }

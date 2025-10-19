@@ -1,8 +1,14 @@
+// src/services/AutoPickerService.js
 import { getCoreUniverse } from "../integrations/kite/universe.js";
 import { getTechScoresForSymbol } from "./TechFactorService.js";
-import { MongoClient } from "mongodb";
+
 import { shortlistUniverse } from "./FastFilterService.js";
 import { isMarketOpenIST } from "../utils/marketHours.js";
+import { getDb } from "../db/mongo.js";
+import {
+  getTodayShortlist,
+  buildAndSaveShortlist,
+} from "./ShortlistService.js";
 
 const HARD_GATES = {
   minAvg1mVol: 200000, // liquidity
@@ -12,83 +18,75 @@ const HARD_GATES = {
 };
 
 export async function runAutoPick({ debug = false } = {}) {
-  const universe = await getCoreUniverse();
+  // inside runAutoPick
+  const live = isMarketOpenIST();
+  const core = await getCoreUniverse();
 
-  const live = isMarketOpenIST(); // true during 09:15–15:30 IST
+  // 1) try saved shortlist
+  let symList = await getTodayShortlist();
 
-  // Stage-1: require depth only when live
-  const short = await shortlistUniverse(universe, {
-    minPrice: HARD_GATES.minPrice,
-    maxSpreadPct: 0.006,
-    preferPositiveGap: true,
-    limit: live ? 80 : 120, // off-hours keep a slightly larger shortlist
-    requireDepth: live,
-  });
+  // 2) compute if missing
+  let shortlistRows = [];
+  if (!symList.length) {
+    // first pass: strict (depth required when live)
+    let short = await shortlistUniverse(core, {
+      minPrice: HARD_GATES.minPrice,
+      maxSpreadPct: 0.006,
+      preferPositiveGap: true,
+      limit: live ? 80 : 120,
+      requireDepth: live,
+    });
 
-  const results = await scoreUniverse(short, 5);
-
-  const passed = [];
-  const failed = [];
-  for (const r of results) {
-    if (!r) continue;
-    if (passGates(r, live)) passed.push(r);
-    else
-      failed.push({
-        symbol: r.symbol,
-        name: r.name,
-        reasons: gateReasons(r, live),
+    // fallback: if empty while live, retry without depth and slightly looser spread
+    if (live && short.length === 0) {
+      console.warn("[shortlist] strict returned 0; retrying without depth…");
+      short = await shortlistUniverse(core, {
+        minPrice: HARD_GATES.minPrice,
+        maxSpreadPct: 0.01, // 1%
+        preferPositiveGap: true,
+        limit: 120,
+        requireDepth: false,
       });
-  }
+    }
 
-  const ranked = passed.sort((a, b) => b.scores.techTotal - a.scores.techTotal);
-  const top5 = ranked.slice(0, 5);
-  const pick = ranked[0] || null;
-
-  const doc = {
-    ts: new Date(),
-    pick,
-    top5,
-    universeSize: universe.length,
-    shortlisted: short.map((x) => ({ symbol: x.symbol, name: x.name })),
-    filteredSize: passed.length,
-    rules: { HARD_GATES, live },
-  };
-
-  await savePick(doc);
-
-  if (debug) {
-    doc.considered = results.filter(Boolean).map((r) => ({
-      symbol: r.symbol,
-      name: r.name,
-      techTotal: r.scores.techTotal,
-    }));
-    doc.filteredOut = failed;
+    symList = short.map((s) => s.symbol);
+    shortlistRows = short;
+    if (symList.length) await buildAndSaveShortlist(); // seed DB for later calls
   } else {
-    doc.considered = short.map((s) => ({ symbol: s.symbol, name: s.name }));
+    const quickMap = new Map(core.map((x) => [x.symbol, x]));
+    shortlistRows = symList.map((s) => quickMap.get(s)).filter(Boolean);
   }
 
-  return doc;
+  if (shortlistRows.length === 0) {
+    // still nothing → return early with an informative payload
+    const doc = {
+      ts: new Date(),
+      pick: null,
+      top5: [],
+      universeSize: core.length,
+      shortlisted: [],
+      filteredSize: 0,
+      rules: { HARD_GATES, live, fallbackTried: live },
+    };
+    await savePick(doc);
+    return doc;
+  }
+
+  // …then proceed to scoreUniverse(shortlistRows, …) and the rest of your logic6;
 }
-
+function normalizeNews(x) {
+  // compress to [-1, 1] using tanh-like squashing
+  return Math.max(-1, Math.min(1, x / 2));
+}
 export async function getLatestPick() {
-  const uri = process.env.MONGO_URI;
-  const dbName = process.env.DB_NAME || "scanner_app";
-  const client = new MongoClient(uri, { ignoreUndefined: true });
-  try {
-    await client.connect();
-    const db = client.db(dbName);
-    const row = await db
-      .collection("auto_picks")
-      .find()
-      .sort({ ts: -1 })
-      .limit(1)
-      .toArray();
-    return row[0] || null;
-  } finally {
-    try {
-      await client.close();
-    } catch {}
-  }
+  const db = getDb();
+  const row = await db
+    .collection("auto_picks")
+    .find()
+    .sort({ ts: -1 })
+    .limit(1)
+    .toArray();
+  return row[0] || null;
 }
 
 // ---- helpers ----
@@ -133,19 +131,9 @@ async function scoreUniverse(universe, concurrency = 5) {
 }
 
 async function savePick(doc) {
-  const uri = process.env.MONGO_URI;
-  if (!uri) return;
-  const dbName = process.env.DB_NAME || "scanner_app";
-  const client = new MongoClient(uri, { ignoreUndefined: true });
-  try {
-    await client.connect();
-    const db = client.db(dbName);
-    await db.collection("auto_picks").insertOne(doc);
-  } finally {
-    try {
-      await client.close();
-    } catch {}
-  }
+  const db = getDb();
+  await db.collection("auto_picks").insertOne(doc); // auto-creates collection
+  console.log("[pick] saved run @", doc.ts);
 }
 
 /** Wrapper class so existing imports keep working */

@@ -1,4 +1,5 @@
 import cron from "node-cron";
+import { isMarketOpenIST } from "../utils/marketHours.js";
 const tz = "Asia/Kolkata";
 
 async function hit(url, body) {
@@ -29,5 +30,15 @@ cron.schedule(
     hit("http://localhost:8000/api/universe/build-today", {
       addons: [],
     }),
+  { timezone: tz }
+);
+// Pull news every 5 minutes on trading days (also fine off-hours if you want)
+cron.schedule(
+  "*/5 9-15 * * 1-5",
+  async () => {
+    try {
+      await fetch("http://localhost:8000/api/news/refresh", { method: "POST" });
+    } catch {}
+  },
   { timezone: tz }
 );
