@@ -3,6 +3,7 @@ import "./config/env.js";
 import express from "express";
 import { connectMongo } from "./db/mongo.js";
 import { ensureIndexes } from "./db/indexes.js";
+import autoPickRoutes from "./routes/autoPick.routes.js";
 
 await connectMongo(); // one shared connection for the app
 await ensureIndexes();
@@ -19,4 +20,5 @@ const PORT = process.env.PORT || 8000;
 const app = await createApp();
 
 app.use("/api/kite", kiteRoutes);
+app.use("/api/pick", autoPickRoutes);
 app.listen(PORT, () => console.log(`[auto-pick] listening on ${PORT}`));

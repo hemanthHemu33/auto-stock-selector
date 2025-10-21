@@ -75,6 +75,8 @@ POST http://localhost:8000/api/universe/build-today
 GET http://localhost:8000/api/shortlist/today
 → same symbols array
 
+POST http://localhost:8000/api/pick/finalize
+
 <!-- *************************************************************************************** -->
 
 i want to add this flow to my autopicker
