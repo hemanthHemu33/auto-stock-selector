@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node --env-file=.env src/server.js",
     "start": "node src/server.js",
+    "test": "node --test",
     "kite:login": "node scripts/kite-login.js",
     "kite:dump": "node scripts/kite-dump.js"
   },
