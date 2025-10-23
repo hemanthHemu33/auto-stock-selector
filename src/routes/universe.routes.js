@@ -72,9 +72,15 @@ r.post("/build-today", async (req, res, next) => {
  */
 r.get("/today", async (_req, res, next) => {
   try {
-    const symbols = await getTodayShortlist(); // ["NSE:HAL", ...]
     const core = await getCoreUniverse();
     const nameBySym = new Map(core.map((x) => [x.symbol, x.name]));
+
+    let symbols = await getTodayShortlist(); // ["NSE:HAL", ...]
+    if (!symbols.length) {
+      // No persisted shortlist yet (fresh boot or off-hours). Fallback to core.
+      symbols = core.map((x) => x.symbol);
+    }
+
     res.json({
       ok: true,
       count: symbols.length,
