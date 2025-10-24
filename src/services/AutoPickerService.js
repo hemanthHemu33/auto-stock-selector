@@ -39,161 +39,73 @@ function useDep(name) {
 }
 
 export async function runAutoPick({ debug = false } = {}) {
-  const live = useDep("isMarketOpenIST")();
-  const core = await useDep("getCoreUniverse")();
+  // 1) Core F&O (~208) for today
+  const core = await getCoreUniverse(); // <-- was 'universe' before; keep 'core'
+  const live = isMarketOpenIST(); // 09:15–15:30 IST
 
-  // 1) try saved shortlist
-  let symList = await useDep("getTodayShortlist")();
-  let shortlistRows = [];
-  let fallbackTried = false;
-  const shortlistSource = symList.length ? "cached" : "generated";
+  // 2) Fast shortlist using live quotes
+  const short = await shortlistUniverse(core, {
+    minPrice: HARD_GATES.minPrice,
+    maxSpreadPct: 0.006, // a bit looser at shortlist stage
+    preferPositiveGap: true,
+    limit: live ? 120 : 120, // keep a wider shortlist off-hours too
+    requireDepth: live, // only enforce depth when market is live
+  });
 
-  // 2) compute if missing
-  if (!symList.length) {
-    // first pass: strict (depth required when live)
-    let short = await useDep("shortlistUniverse")(core, {
-      minPrice: HARD_GATES.minPrice,
-      maxSpreadPct: 0.006,
-      preferPositiveGap: true,
-      limit: live ? 80 : 120,
-      requireDepth: live,
-    });
+  // 3) Heavy scoring only on shortlist
+  const results = await scoreUniverse(short, 5);
 
-    // fallback: if empty while live, retry without depth and slightly looser spread
-    if (live && short.length === 0) {
-      console.warn("[shortlist] strict returned 0; retrying without depth…");
-      short = await useDep("shortlistUniverse")(core, {
-        minPrice: HARD_GATES.minPrice,
-        maxSpreadPct: 0.01, // 1%
-        preferPositiveGap: true,
-        limit: 120,
-        requireDepth: false,
+  // 4) Final gates + ranking
+  const passed = [];
+  const failed = [];
+  for (const r of results) {
+    if (!r) continue;
+    if (passGates(r, live)) passed.push(r);
+    else
+      failed.push({
+        symbol: r.symbol,
+        name: r.name,
+        reasons: gateReasons(r, live),
       });
-      fallbackTried = true;
-    }
-
-    symList = short.map((s) => s.symbol);
-    shortlistRows = short;
-    if (symList.length) await useDep("buildAndSaveShortlist")(); // seed DB for later calls
-  } else {
-    const quickMap = new Map(core.map((x) => [x.symbol, x]));
-    shortlistRows = symList.map((s) => quickMap.get(s)).filter(Boolean);
   }
 
-  if (shortlistRows.length === 0) {
-    const baseDoc = {
-      ts: new Date(),
-      pick: null,
-      top5: [],
-      universeSize: core.length,
-      shortlisted: [],
-      shortlistedCount: 0,
-      filteredSize: 0,
-      rules: buildRulesMeta(live, fallbackTried),
-    };
-    await savePick(baseDoc);
-    return withDebug(baseDoc, debug, {
-      shortlistSource,
-      rejected: [],
-      newsConsidered: 0,
-    });
-  }
+  const ranked = passed.sort(
+    (a, b) => (b.scores?.techTotal || 0) - (a.scores?.techTotal || 0)
+  );
+  const top5 = ranked.slice(0, 5);
+  const pick = ranked[0] || null;
 
-  const shortlistMap = new Map(shortlistRows.map((row) => [row.symbol, row]));
-
-  const newsMap = await useDep("getNewsScoresForSymbols")(symList, {
-    windowMin: POLICY.NEWS_WINDOW_MIN,
-  });
-
-  const techRows = await scoreUniverse(shortlistRows, live ? 8 : 5);
-
-  const qualified = [];
-  const rejected = [];
-
-  for (const tech of techRows) {
-    const base = shortlistMap.get(tech.symbol) || {};
-    const merged = { ...base, ...tech };
-    const gatesOk = passGates(merged, live);
-    const reasons = gatesOk ? [] : gateReasons(merged, live);
-
-    const news = newsMap.get(tech.symbol) || null;
-    const newsRaw = news?.score ?? 0;
-    const newsScore = clamp01(newsRaw);
-    const newsHits = news?.hits ?? 0;
-    const newsAge = news?.ageMin ?? null;
-    const newsQualified =
-      newsHits >= POLICY.NEWS_GATES.minHits &&
-      newsRaw >= POLICY.NEWS_GATES.minScore &&
-      (newsAge == null || newsAge <= POLICY.NEWS_GATES.maxAgeMin);
-
-    const techScore = clamp01(tech.scores?.techTotal ?? 0);
-    const blendTotal =
-      POLICY.WEIGHTS.tech * techScore +
-      POLICY.WEIGHTS.news * (newsQualified ? newsScore : 0);
-
-    const candidate = {
-      symbol: tech.symbol,
-      name: tech.name ?? base.name ?? null,
-      total: blendTotal,
-      techScore,
-      newsScore,
-      newsQualified,
-      newsHits,
-      newsAgeMin: newsAge,
-      newsReasons: news?.reasons || [],
-      last: pickNumber(merged.last),
-      avg1mVol: pickNumber(merged.avg1mVol),
-      atrPct: pickNumber(merged.atrPct),
-      spreadPct: pickNumber(merged.spreadPct),
-      gapPct: pickNumber(merged.gapPct ?? merged.gap),
-      vwapDistPct: pickNumber(merged.vwapDistPct),
-      ret5m: pickNumber(merged.ret5m),
-      ret15m: pickNumber(merged.ret15m),
-      ret60m: pickNumber(merged.ret60m),
-      scores: tech.scores || {},
-    };
-
-    if (!gatesOk) {
-      rejected.push({ ...candidate, gateReasons: reasons });
-      continue;
-    }
-
-    qualified.push(candidate);
-  }
-
-  qualified.sort((a, b) => {
-    if (b.total !== a.total) return b.total - a.total;
-    if (b.techScore !== a.techScore) return b.techScore - a.techScore;
-    return (b.newsScore || 0) - (a.newsScore || 0);
-  });
-
-  const top5 = qualified.slice(0, PICK_LIMIT).map(buildPublicCandidate);
-  const baseDoc = {
+  // 5) Persist run
+  const doc = {
     ts: new Date(),
-    pick: top5[0] || null,
+    pick,
     top5,
     universeSize: core.length,
-    shortlisted: shortlistRows.map((r) => r.symbol),
-    shortlistedCount: shortlistRows.length,
-    filteredSize: qualified.length,
-    rules: buildRulesMeta(live, fallbackTried),
+    shortlisted: short.map((x) => ({ symbol: x.symbol, name: x.name })),
+    filteredSize: passed.length,
+    rules: { HARD_GATES, live },
   };
+  await savePick(doc);
 
-  if (!qualified.length) {
-    baseDoc.pick = null;
+  // 6) Response shaping
+  if (debug) {
+    doc.considered = results
+      .filter(Boolean)
+      .map((r) => ({
+        symbol: r.symbol,
+        name: r.name,
+        techTotal: r.scores?.techTotal ?? null,
+      }));
+    doc.filteredOut = failed;
+  } else {
+    doc.considered = short.map((s) => ({ symbol: s.symbol, name: s.name }));
   }
 
-  await savePick(baseDoc);
-
-  return withDebug(baseDoc, debug, {
-    shortlistSource,
-    rejected: rejected.map(buildRejectedCandidate),
-    newsConsidered: newsMap.size,
-  });
+  return doc;
 }
 
 export async function getLatestPick() {
-  const db = useDep("getDb")();
+  const db = getDb();
   const row = await db
     .collection("auto_picks")
     .find()
@@ -208,10 +120,9 @@ function passGates(r, live = true) {
   const priceOk = (r.last || 0) >= HARD_GATES.minPrice;
   const volOk = (r.avg1mVol || 0) >= HARD_GATES.minAvg1mVol;
   const atrOk = (r.atrPct || 0) <= HARD_GATES.maxATRPct;
-  const spreadOk = live ? (r.spreadPct || 1) <= HARD_GATES.maxSpreadPct : true;
+  const spreadOk = live ? (r.spreadPct ?? 0) <= HARD_GATES.maxSpreadPct : true;
   return priceOk && volOk && atrOk && spreadOk;
 }
-
 function gateReasons(r, live = true) {
   const reasons = [];
   if ((r.last || 0) < HARD_GATES.minPrice)
@@ -220,37 +131,34 @@ function gateReasons(r, live = true) {
     reasons.push(`avg1mVol<${HARD_GATES.minAvg1mVol}`);
   if ((r.atrPct || 0) > HARD_GATES.maxATRPct)
     reasons.push(`atr%>${(HARD_GATES.maxATRPct * 100).toFixed(1)}%`);
-  if (live && (r.spreadPct || 1) > HARD_GATES.maxSpreadPct)
+  if (live && (r.spreadPct ?? 1) > HARD_GATES.maxSpreadPct)
     reasons.push(`spread>${(HARD_GATES.maxSpreadPct * 100).toFixed(2)}%`);
   return reasons;
 }
 
-async function scoreUniverse(universe, concurrency = 5) {
+async function scoreUniverse(list, concurrency = 5) {
   const out = [];
   let i = 0;
-  const fetchTech = useDep("getTechScoresForSymbol");
   async function worker() {
-    while (i < universe.length) {
+    while (i < list.length) {
       const idx = i++;
-      const row = universe[idx];
+      const row = list[idx];
       try {
-        const res = await fetchTech(row);
-        out.push(res);
-      } catch (_) {
-        /* ignore per-symbol errors */
+        const res = await getTechScoresForSymbol(row); // must return last, avg1mVol, atrPct, spreadPct, scores.techTotal, etc.
+        if (res) out.push(res);
+      } catch {
+        // ignore per-symbol errors
       }
     }
   }
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
   return out;
 }
-
 async function savePick(doc) {
-  const db = useDep("getDb")();
-  await db.collection("auto_picks").insertOne(doc); // auto-creates collection
-  console.log("[pick] saved run @", doc.ts);
+  const db = getDb();
+  await db.collection("auto_picks").insertOne(doc); // creates the collection if missing
+  console.log("[auto-pick] saved run @", doc.ts.toISOString());
 }
-
 function clamp01(x) {
   const n = Number(x);
   if (!Number.isFinite(n)) return 0;
@@ -339,4 +247,3 @@ export class AutoPickerService {
     return getLatestPick();
   }
 }
-
