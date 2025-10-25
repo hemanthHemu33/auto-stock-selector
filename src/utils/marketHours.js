@@ -15,3 +15,11 @@ export function isMarketOpenIST(d = new Date()) {
   const mins = t.getHours() * 60 + t.getMinutes();
   return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 30; // 09:15–15:30
 }
+
+export function minutesSinceOpenIST(d = new Date()) {
+  const t = timeInKolkata(d);
+  if (!isTradingDayIST(t)) return 0;
+  const mins = t.getHours() * 60 + t.getMinutes();
+  const openMins = 9 * 60 + 15;
+  return Math.max(0, mins - openMins);
+}

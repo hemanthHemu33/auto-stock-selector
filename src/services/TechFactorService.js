@@ -1,97 +1,109 @@
 import { getKite } from "../integrations/kite/kiteClient.js";
-
+import { isMarketOpenIST, minutesSinceOpenIST } from "../utils/marketHours.js";
 function clamp(x, a = 0, b = 1) {
   return Math.max(a, Math.min(b, x));
 }
 
 export async function getTechScoresForSymbol(row) {
-  // row = { symbol: "NSE:XYZ", token, ... }
   const kite = getKite();
+  const token = Number(row.token);
+  if (!token) return null;
 
-  // --- Daily candles (ATR context)
-  const to = new Date();
-  const fromDaily = new Date(to);
-  fromDaily.setDate(to.getDate() - 90);
-  const daily = await kite.getHistoricalData(
-    row.token,
-    fromDaily.toISOString(),
-    to.toISOString(),
-    "day"
-  );
-  if (!daily?.length) throw new Error("no daily history");
+  // 1) Live quote + depth (fast)
+  let q;
+  try {
+    const m = await kite.getQuote([token]);
+    q = m?.[token];
+  } catch {
+    return null;
+  }
+  if (!q) return null;
 
-  const prevClose = daily.at(-2)?.close ?? daily.at(-1)?.close;
-  const lastClose = daily.at(-1)?.close ?? prevClose;
-  const atr = ATR14(daily);
-  const atrPct = atr / (lastClose || 1);
+  const last = n(q.last_price);
+  const ohlc = q.ohlc || {};
+  const open = n(ohlc.open);
+  const prevClose = n(ohlc.close);
 
-  // --- Intraday minute data
-  const openTime = new Date(to);
-  openTime.setHours(9, 15, 0, 0);
-  const intraday = await kite.getHistoricalData(
-    row.token,
-    openTime.toISOString(),
-    to.toISOString(),
-    "minute"
-  );
+  // Spread from depth (fallback to modest default if missing)
+  let spreadPct = null;
+  try {
+    const bestBid = n(q.depth?.buy?.[0]?.price);
+    const bestAsk = n(q.depth?.sell?.[0]?.price);
+    if (bestBid > 0 && bestAsk > 0) {
+      const mid = (bestBid + bestAsk) / 2;
+      spreadPct = mid > 0 ? (bestAsk - bestBid) / mid : null;
+    }
+  } catch {}
+  if (spreadPct == null) spreadPct = 0.0025; // 0.25% fallback
 
-  const {
-    vwap,
-    avg1mVol,
-    ret5m,
-    ret15m,
-    ret60m,
-    firstOpen,
-    lastPrice: closeNow,
-  } = computeIntraday(intraday);
+  // Avg 1-minute volume estimate (live): total volume today / minutes since open
+  let avg1mVol = 0;
+  const volToday = n(q.volume || q.volume_traded);
+  if (volToday > 0 && isMarketOpenIST()) {
+    const mins = Math.max(1, minutesSinceOpenIST());
+    avg1mVol = Math.round(volToday / mins);
+  }
 
-  // --- LTP + Quote for spread
-  const ltpMap = await kite.getLTP([row.symbol]);
-  const last = ltpMap[row.symbol]?.last_price ?? closeNow ?? lastClose;
-
-  const quote = await kite.getQuote([row.symbol]);
-  const depth = quote[row.symbol]?.depth;
-  const bestBid = depth?.buy?.[0]?.price ?? last;
-  const bestAsk = depth?.sell?.[0]?.price ?? last;
-  const mid = (bestBid + bestAsk) / 2 || last;
-  const spreadPct = mid ? (bestAsk - bestBid) / mid : 0.001;
-
-  // --- Derived features
-  const gapPct =
-    firstOpen && prevClose ? (firstOpen - prevClose) / prevClose : 0;
-  const vwapDistPct = vwap ? (last - vwap) / vwap : 0;
-
-  // --- Scores
-  const momBlend =
-    0.5 * (ret5m || 0) + 0.3 * (ret15m || 0) + 0.2 * (ret60m || 0);
-  const momScore = clamp(momBlend);
-  const vwapScore = 1 - clamp(Math.abs(vwapDistPct) / 0.01);
-  const atrScore = 1 - clamp((atrPct - 0.01) / 0.05);
-  const liqScore = clamp(
-    Math.min((avg1mVol || 0) / 200000, 1) * (1 - (spreadPct || 0) / 0.004)
-  );
-  const gapScore = clamp(gapPct / 0.03);
+  // 2) ATR% from recent daily bars (short window; rate-limit friendly)
+  let atrPct = null;
+  try {
+    const to = new Date();
+    const from = new Date();
+    from.setDate(to.getDate() - 20);
+    const daily = await kite.getHistoricalData(
+      token,
+      from.toISOString(),
+      to.toISOString(),
+      "day"
+    );
+    if (Array.isArray(daily) && daily.length >= 15 && last > 0) {
+      const trs = [];
+      for (let i = 1; i < daily.length; i++) {
+        const d = daily[i];
+        const p = daily[i - 1];
+        const tr1 = n(d.high) - n(d.low);
+        const tr2 = Math.abs(n(d.high) - n(p.close));
+        const tr3 = Math.abs(n(d.low) - n(p.close));
+        trs.push(Math.max(tr1, tr2, tr3));
+      }
+      const nBars = Math.min(14, trs.length);
+      const atr = trs.slice(-nBars).reduce((s, v) => s + v, 0) / nBars;
+      atrPct = atr / last;
+    }
+  } catch {
+    // ignore ATR failure; leave null
+  }
+  // 3) Simple tech score: price change + intraday momentum + liquidity - penalties
+  const pctChg = prevClose > 0 ? (last - prevClose) / prevClose : 0;
+  const intraday = open > 0 ? (last - open) / open : 0;
+  const liqScore = clamp01(avg1mVol / 200000); // saturate at your target liquidity
+  const spreadPenalty = clamp01(spreadPct / 0.0035);
+  const atrPenalty = atrPct != null ? clamp01(atrPct / 0.05) : 0.5;
 
   const techTotal =
-    0.55 * momScore + 0.25 * liqScore + 0.1 * vwapScore + 0.1 * atrScore;
+    2.0 * pctChg +
+    1.5 * intraday +
+    0.5 * liqScore -
+    0.6 * spreadPenalty -
+    0.3 * atrPenalty;
 
   return {
-    symbol: row.symbol,
-    name: row.name, // <-- add this
-    token: row.token,
+    ...row,
     last,
-    prevClose,
-    firstOpen,
-    gapPct,
-    vwapDistPct,
-    atrPct,
     avg1mVol,
     spreadPct,
-    ret5m,
-    ret15m,
-    ret60m,
-    scores: { momScore, vwapScore, atrScore, liqScore, gapScore, techTotal },
+    atrPct,
+    scores: { techTotal },
   };
+}
+
+/* ---------------------- utils ---------------------- */
+function n(x) {
+  const v = Number(x);
+  return Number.isFinite(v) ? v : 0;
+}
+function clamp01(x) {
+  return Math.max(0, Math.min(1, x));
 }
 
 function ATR14(daily) {
