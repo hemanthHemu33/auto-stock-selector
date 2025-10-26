@@ -20,4 +20,11 @@ const app = await createApp();
 
 app.use("/api/kite", kiteRoutes);
 app.use("/api/pick", autoPickRoutes);
-app.listen(PORT, () => console.log(`[auto-pick] listening on ${PORT}`));
+// app.listen(PORT, () => console.log(`[auto-pick] listening on ${PORT}`));
+(async () => {
+  await connectMongo();
+  // (If you use Kite token loader, call it here)
+  app.listen(PORT, () => {
+    console.log(`[auto-pick] listening on ${PORT}`);
+  });
+})();
