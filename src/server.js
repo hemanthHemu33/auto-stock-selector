@@ -9,8 +9,8 @@ import "./jobs/scheduler.js";
 import { createApp } from "./app.js";
 import { initKiteAccessTokenFromMongo } from "./integrations/kite/tokenFromMongo.js";
 import kiteRoutes from "./routes/kite.routes.js";
-import "./jobs/schedule.js";
-
+// import "./jobs/scheduler.js";
+import { getCoreUniverse } from "./integrations/kite/universe.js";
 await connectMongo(); // one shared connection for the app
 await ensureIndexes();
 await initKiteAccessTokenFromMongo(); // <-- pull today's token from Mongo
@@ -26,5 +26,6 @@ app.use("/api/pick", autoPickRoutes);
   // (If you use Kite token loader, call it here)
   app.listen(PORT, () => {
     console.log(`[auto-pick] listening on ${PORT}`);
+    getCoreUniverse().catch(() => {});
   });
 })();

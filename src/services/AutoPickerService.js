@@ -11,10 +11,16 @@ import selectionConfig from "../config/selection.js";
 import { getNewsScoresForSymbols } from "./NewsFactorService.js";
 import { POLICY } from "../config/policy.js";
 import { isMarketOpenIST, minutesSinceOpenIST } from "../utils/marketHours.js";
+// const HARD_GATES = {
+//   minAvg1mVol: 200000, // liquidity
+//   maxSpreadPct: 0.0035, // 0.35%
+//   maxATRPct: 0.05, // 5%
+//   minPrice: 20,
+// };
 const HARD_GATES = {
-  minAvg1mVol: 200000, // liquidity
-  maxSpreadPct: 0.0035, // 0.35%
-  maxATRPct: 0.05, // 5%
+  minAvg1mVol: 50000, // was 200000
+  maxSpreadPct: 0.006, // was 0.0035
+  maxATRPct: 0.07, // was 0.05
   minPrice: 20,
 };
 
@@ -125,13 +131,27 @@ export async function getLatestPick() {
 
 /* ---------------- helpers ---------------- */
 
-function passGates(r, G, live) {
-  const priceOk = (r.last || 0) >= G.minPrice;
-  const volOk = (r.avg1mVol || 0) >= G.minAvg1mVol;
-  const atrOk = r.atrPct == null ? true : r.atrPct <= G.maxATRPct; // allow if ATR missing
-  const spreadOk = live ? (r.spreadPct ?? 0) <= G.maxSpreadPct : true;
-  return priceOk && volOk && atrOk && spreadOk;
+// function passGates(r, G, live) {
+//   const priceOk = (r.last || 0) >= G.minPrice;
+//   const volOk = (r.avg1mVol || 0) >= G.minAvg1mVol;
+//   const atrOk = r.atrPct == null ? true : r.atrPct <= G.maxATRPct; // allow if ATR missing
+//   const spreadOk = live ? (r.spreadPct ?? 0) <= G.maxSpreadPct : true;
+//   return priceOk && volOk && atrOk && spreadOk;
+// }
+
+function passGates(r, live = true) {
+  const last = r.last || 0;
+  const vol = r.avg1mVol || 0;
+  const turnover1m = r.avg1mTurnover ?? last * vol; // ₹/min approx
+
+  const priceOk = last >= HARD_GATES.minPrice;
+  const liqOk = turnover1m >= 2e7; // ₹2 crore/min (tune)
+  const atrOk = (r.atrPct || 0) <= HARD_GATES.maxATRPct;
+  const spreadOk = live ? (r.spreadPct || 1) <= HARD_GATES.maxSpreadPct : true;
+
+  return priceOk && liqOk && atrOk && spreadOk;
 }
+
 function gateReasons(r, G, live) {
   const reasons = [];
   if ((r.last || 0) < G.minPrice) reasons.push(`price<₹${G.minPrice}`);
