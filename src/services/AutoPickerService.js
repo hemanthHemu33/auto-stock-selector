@@ -95,7 +95,6 @@ export async function runAutoPick({ debug = false } = {}) {
   // });
 
   const short = await shortlistUniverse(core, {
-    // shortlist must use real numbers; pull from HARD_GATES
     minPrice: HARD_GATES.minPrice,
     maxSpreadPct: Math.max(HARD_GATES.maxSpreadPct, 0.006),
     preferPositiveGap: true,
@@ -110,7 +109,8 @@ export async function runAutoPick({ debug = false } = {}) {
   const failed = [];
   for (const r of results) {
     if (!r) continue;
-    if (passGates(r, gates, live)) passed.push(r);
+    // if (passGates(r, gates, live)) passed.push(r);
+    if (passGates(r, HARD_GATES, live)) passed.push(r);
     else
       failed.push({
         symbol: r.symbol,
