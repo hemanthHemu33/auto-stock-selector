@@ -89,3 +89,5 @@ F&O 208 (daily refresh)
 → score = source quality + catalyst impact + freshness + specificity + novelty
 → guardrails: rumor penalty, min-source count, cooldown, sector diversity
 → TOP_N symbols (with reason codes) → scanner project consumes
+
+node -r dotenv/config scripts/morning-run.js

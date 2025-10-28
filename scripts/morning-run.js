@@ -6,10 +6,11 @@ import { AutoPickerService } from "../src/services/AutoPickerService.js";
 import { publishFinalList } from "../src/services/PublishService.js";
 import { toISTDateKey } from "../src/utils/time.js";
 import { isTradingDayIST } from "../src/utils/holidays.js";
-
+import { initKiteAccessTokenFromMongo } from "../src/integrations/kite/tokenFromMongo.js";
 async function main() {
   // 1) DB first
   await connectMongo();
+  await initKiteAccessTokenFromMongo();
 
   // 2) Skip if holiday
   const todayKey = toISTDateKey();
