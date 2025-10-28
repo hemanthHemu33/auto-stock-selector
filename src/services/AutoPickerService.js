@@ -23,6 +23,15 @@ const HARD_GATES = {
   maxATRPct: 0.07, // was 0.05
   minPrice: 20,
 };
+// Base/default gates used by the picker (tweak as you like)
+const BASE_GATES = Object.freeze({
+  MIN_MCAP_CR: 2000, // example: ₹2,000 Cr
+  ALLOW_FNO_ONLY: true, // restrict to F&O if true
+  MIN_AVG_DVOL_CR: 5, // example: ₹5 Cr avg daily traded value
+  EXCLUDE_DERIV_BAN: true,
+  EXCLUDE_PENNY: true,
+  MAX_SYMBOLS: 15,
+});
 
 const PICK_LIMIT = 5;
 
@@ -37,17 +46,34 @@ const defaultDeps = {
   getNewsScoresForSymbols,
 };
 
-// time-adaptive gates (looser just after open)
-function currentGates(live) {
-  if (!live) {
-    return { ...BASE_GATES, minAvg1mVol: 0, maxSpreadPct: 0.01 };
-  }
-  const m = minutesSinceOpenIST();
-  if (m < 15) return { ...BASE_GATES, minAvg1mVol: 50000, maxSpreadPct: 0.008 };
-  if (m < 45)
-    return { ...BASE_GATES, minAvg1mVol: 120000, maxSpreadPct: 0.005 };
-  return { ...BASE_GATES };
+// Merge env/overrides with defaults
+function currentGates(overrides = {}) {
+  const env = process.env || {};
+
+  const parsed = {
+    MIN_MCAP_CR: env.MIN_MCAP_CR ? Number(env.MIN_MCAP_CR) : undefined,
+    ALLOW_FNO_ONLY: env.ALLOW_FNO_ONLY
+      ? env.ALLOW_FNO_ONLY === "true"
+      : undefined,
+    MIN_AVG_DVOL_CR: env.MIN_AVG_DVOL_CR
+      ? Number(env.MIN_AVG_DVOL_CR)
+      : undefined,
+    EXCLUDE_DERIV_BAN: env.EXCLUDE_DERIV_BAN
+      ? env.EXCLUDE_DERIV_BAN === "true"
+      : undefined,
+    EXCLUDE_PENNY: env.EXCLUDE_PENNY ? env.EXCLUDE_PENNY === "true" : undefined,
+    MAX_SYMBOLS: env.MAX_SYMBOLS ? Number(env.MAX_SYMBOLS) : undefined,
+  };
+
+  return {
+    ...BASE_GATES,
+    ...Object.fromEntries(
+      Object.entries(parsed).filter(([, v]) => v !== undefined)
+    ),
+    ...overrides,
+  };
 }
+
 const overrideDeps = {};
 
 function useDep(name) {
@@ -60,9 +86,18 @@ export async function runAutoPick({ debug = false } = {}) {
   const gates = currentGates(live);
 
   // Stage-1 shortlist (cheap)
+  // const short = await shortlistUniverse(core, {
+  //   minPrice: gates.minPrice,
+  //   maxSpreadPct: Math.max(gates.maxSpreadPct, 0.006), // a bit looser at shortlist stage
+  //   preferPositiveGap: true,
+  //   limit: 120,
+  //   requireDepth: live,
+  // });
+
   const short = await shortlistUniverse(core, {
-    minPrice: gates.minPrice,
-    maxSpreadPct: Math.max(gates.maxSpreadPct, 0.006), // a bit looser at shortlist stage
+    // shortlist must use real numbers; pull from HARD_GATES
+    minPrice: HARD_GATES.minPrice,
+    maxSpreadPct: Math.max(HARD_GATES.maxSpreadPct, 0.006),
     preferPositiveGap: true,
     limit: 120,
     requireDepth: live,
@@ -80,7 +115,7 @@ export async function runAutoPick({ debug = false } = {}) {
       failed.push({
         symbol: r.symbol,
         name: r.name,
-        reasons: gateReasons(r, gates, live),
+        reasons: gateReasons(r, HARD_GATES, live),
       });
   }
 
@@ -97,7 +132,8 @@ export async function runAutoPick({ debug = false } = {}) {
     universeSize: core.length,
     shortlisted: short.map((x) => ({ symbol: x.symbol, name: x.name })),
     filteredSize: passed.length,
-    rules: { HARD_GATES: BASE_GATES, live },
+    // rules: { HARD_GATES: BASE_GATES, live },
+    rules: { HARD_GATES, live },
   };
   await savePick(doc);
 
@@ -119,7 +155,7 @@ export async function runAutoPick({ debug = false } = {}) {
   return doc;
 }
 export async function getLatestPick() {
-  const db = getDb();
+  const db = await getDb();
   const row = await db
     .collection("auto_picks")
     .find()
@@ -139,15 +175,16 @@ export async function getLatestPick() {
 //   return priceOk && volOk && atrOk && spreadOk;
 // }
 
-function passGates(r, live = true) {
+function passGates(r, G = HARD_GATES, live = true) {
   const last = r.last || 0;
   const vol = r.avg1mVol || 0;
   const turnover1m = r.avg1mTurnover ?? last * vol; // ₹/min approx
 
-  const priceOk = last >= HARD_GATES.minPrice;
-  const liqOk = turnover1m >= 2e7; // ₹2 crore/min (tune)
-  const atrOk = (r.atrPct || 0) <= HARD_GATES.maxATRPct;
-  const spreadOk = live ? (r.spreadPct || 1) <= HARD_GATES.maxSpreadPct : true;
+  const priceOk = last >= G.minPrice;
+  // relax liquidity to ₹50 lakh/min initially; tune later
+  const liqOk = turnover1m >= 5e6;
+  const atrOk = r.atrPct == null ? true : r.atrPct <= G.maxATRPct; // allow if ATR missing
+  const spreadOk = live ? (r.spreadPct ?? 1) <= G.maxSpreadPct : true;
 
   return priceOk && liqOk && atrOk && spreadOk;
 }
@@ -183,7 +220,7 @@ async function scoreUniverse(list, concurrency = 5) {
   return out;
 }
 async function savePick(doc) {
-  const db = getDb();
+  const db = await getDb();
   await db.collection("auto_picks").insertOne(doc); // creates the collection if missing
   console.log("[auto-pick] saved run @", doc.ts.toISOString());
 }
@@ -274,4 +311,33 @@ export class AutoPickerService {
   static async getLatest() {
     return getLatestPick();
   }
+}
+
+export async function publishTopSymbols(symbols) {
+  if (!Array.isArray(symbols) || symbols.length === 0) {
+    return { matchedCount: 0, modifiedCount: 0, reason: "empty-input" };
+  }
+
+  const db = await getDb();
+  const coll = db.collection("stock_symbols");
+
+  // Update the (only) document — if you keep exactly one doc, this matches it.
+  const res = await coll.updateOne(
+    {}, // match the existing single document
+    { $addToSet: { symbols: { $each: symbols } } },
+    { upsert: false } // do NOT create a new document
+  );
+
+  // Optional: warn if there was no doc to update
+  if (res.matchedCount === 0) {
+    console.warn(
+      "[publishTopSymbols] No existing stock_symbols document found. Skipped (upsert=false)."
+    );
+  }
+
+  return { matchedCount: res.matchedCount, modifiedCount: res.modifiedCount };
+}
+
+export async function publishFinalizedSymbols(symbols) {
+  return publishTopSymbols(symbols);
 }

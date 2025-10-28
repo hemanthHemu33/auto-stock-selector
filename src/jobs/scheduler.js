@@ -16,7 +16,7 @@ import {
 } from "../services/PublishService.js";
 import { acquireLock } from "../db/locks.js";
 import { toIST } from "../utils/time.js";
-
+import { appendToStockSymbols } from "../services/StockSymbolsService.js";
 const tz = "Asia/Kolkata";
 const TOP_N = Number(process.env.AUTO_PUBLISH_TOP_N || 30);
 
@@ -59,20 +59,27 @@ async function publishFromLatest(topN = TOP_N) {
   const pickDoc = latest[0];
   const symbols = symbolsFromPickDoc(pickDoc, topN);
 
-  // If still empty (rare pre-market), degrade to “shortlisted topN”
-  if (symbols.length === 0 && Array.isArray(pickDoc?.shortlisted)) {
+  // If empty, fall back to shortlist
+  if (!symbols.length && Array.isArray(pickDoc?.shortlisted)) {
     const fallback = pickDoc.shortlisted.slice(0, topN).map((x) => x.symbol);
     if (fallback.length) {
-      return publishTopSymbols({
+      const pub = await publishTopSymbols({
         symbols: fallback,
         pickId: pickDoc?._id,
         topN,
       });
+      // ALSO append to stock_symbols (union)
+      const app = await appendToStockSymbols(fallback);
+      return { ...pub, stock_symbols_append: app };
     }
   }
 
   if (!symbols.length) return { ok: false, reason: "no_symbols" };
-  return publishTopSymbols({ symbols, pickId: pickDoc?._id, topN });
+
+  const pub = await publishTopSymbols({ symbols, pickId: pickDoc?._id, topN });
+  // ALSO append to stock_symbols (union)
+  const app = await appendToStockSymbols(symbols);
+  return { ...pub, stock_symbols_append: app };
 }
 
 // ───────────────────────────────────────────────────────────────────────────────

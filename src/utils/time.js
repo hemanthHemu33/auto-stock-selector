@@ -1,14 +1,15 @@
-// Formats any Date/ISO input as IST ISO-8601 with +05:30 offset.
-// Example: 2025-10-09T14:05:12.123+05:30
-const IST_TZ = "Asia/Kolkata";
-const IST_OFFSET = "+05:30";
+// src/utils/time.js
+const TZ = "Asia/Kolkata";
 
-export function toIST(input) {
-  const d = input instanceof Date ? input : new Date(input);
-  if (Number.isNaN(d.getTime())) return null;
+/** Format a Date (or ISO/string) to an IST ISO-like string with offset */
+export function toIST(d = new Date()) {
+  const date = new Date(d);
+  // Build YYYY-MM-DDTHH:mm:ss.sss+05:30 using locale parts for IST
+  const pad = (n, w = 2) => String(n).padStart(w, "0");
 
+  // Convert to IST by using locale with timeZone, then reconstruct
   const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: IST_TZ,
+    timeZone: TZ,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -17,13 +18,25 @@ export function toIST(input) {
     second: "2-digit",
     hour12: false,
   })
-    .formatToParts(d)
+    .formatToParts(date)
     .reduce((acc, p) => ((acc[p.type] = p.value), acc), {});
 
-  const ms = String(d.getMilliseconds()).padStart(3, "0");
-  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}.${ms}${IST_OFFSET}`;
+  const yyyy = parts.year;
+  const mm = parts.month;
+  const dd = parts.day;
+  const hh = parts.hour;
+  const mi = parts.minute;
+  const ss = parts.second;
+
+  // IST is +05:30
+  const ms = pad(date.getMilliseconds(), 3);
+  return `${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}.${ms}+05:30`;
 }
 
-export function nowISTISO() {
-  return toIST(new Date());
+/** Return IST trading-day key as YYYY-MM-DD (e.g., "2025-10-28") */
+export function toISTDateKey(d = new Date()) {
+  return new Date(d).toLocaleDateString("en-CA", { timeZone: TZ });
 }
+
+/** If you need the TZ constant elsewhere */
+export const IST_TZ = TZ;
