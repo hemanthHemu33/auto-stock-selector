@@ -82,6 +82,16 @@ async function publishFromLatest(topN = TOP_N) {
   return { ...pub, stock_symbols_append: app };
 }
 
+async function clearNewsCollections() {
+  const db = getDb();
+  const rawResult = await db.collection("news_raw").deleteMany({});
+  const eventsResult = await db.collection("news_events").deleteMany({});
+  return {
+    rawDeleted: rawResult?.deletedCount ?? 0,
+    eventsDeleted: eventsResult?.deletedCount ?? 0,
+  };
+}
+
 // ───────────────────────────────────────────────────────────────────────────────
 // CRON PLAN (IST):
 // 07:50  Ensure F&O universe for today (DB snapshot)
@@ -163,6 +173,22 @@ cron.schedule(
       console.log(`[cron] ${toIST(new Date())} guard publish:`, res);
     }
   }),
+  { timezone: tz }
+);
+
+cron.schedule(
+  "59 23 */3 * *",
+  async () => {
+    try {
+      if (!(await shouldRunToday("news_cleanup"))) return;
+      const res = await clearNewsCollections();
+      console.log(
+        `[cron] ${toIST(new Date())} news cleanup: rawDeleted=${res.rawDeleted}, eventsDeleted=${res.eventsDeleted}`
+      );
+    } catch (e) {
+      console.error("[cron] news cleanup", e?.message || e);
+    }
+  },
   { timezone: tz }
 );
 
