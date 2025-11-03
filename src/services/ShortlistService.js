@@ -29,22 +29,14 @@ export async function buildAndSaveShortlist({
   const core = await getCoreUniverse();
   const limit = live ? limitLive : limitOff;
 
-  // const short = await shortlistUniverse(core, {
-  //   minPrice,
-  //   maxSpreadPct,
-  //   preferPositiveGap,
-  //   limit,
-  //   requireDepth: live, // require depth only when live
-  // });
-
-  const short = await shortlistUniverse(universe, {
-    minPrice: HARD_GATES.minPrice,
-    maxSpreadPct: 0.006,
-    preferPositiveGap: true,
-    limit: isMarketOpenIST() ? 120 : 120,
-    requireDepth: isMarketOpenIST(),
+  const short = await shortlistUniverse(core, {
+    minPrice,
+    maxSpreadPct,
+    preferPositiveGap,
+    limit,
+    requireDepth: live, // require depth only when live
   });
-  console.log(`[shortlist] took ${short.length}/${universe.length}`);
+  console.log(`[shortlist] took ${short.length}/${core.length}`);
 
   const doc = {
     _id: istDate,

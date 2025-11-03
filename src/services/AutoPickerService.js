@@ -34,6 +34,10 @@ const BASE_GATES = Object.freeze({
 });
 
 const PICK_LIMIT = 5;
+const AUTO_PICK_HISTORY_DAYS = Number(process.env.AUTO_PICK_HISTORY_DAYS ?? 45);
+const AUTO_PICK_MAX_DOCS = Number(process.env.AUTO_PICK_MAX_DOCS ?? 2000);
+
+let autoPickIndexesEnsured = false;
 
 const defaultDeps = {
   getCoreUniverse,
@@ -81,8 +85,12 @@ function useDep(name) {
 }
 
 export async function runAutoPick({ debug = false } = {}) {
-  const core = await getCoreUniverse(); // ~208 names
-  const live = isMarketOpenIST();
+  const getCore = useDep("getCoreUniverse");
+  const marketOpen = useDep("isMarketOpenIST");
+  const shortlistFn = useDep("shortlistUniverse");
+
+  const core = await getCore(); // ~208 names
+  const live = marketOpen();
   const gates = currentGates(live);
 
   // Stage-1 shortlist (cheap)
@@ -94,7 +102,7 @@ export async function runAutoPick({ debug = false } = {}) {
   //   requireDepth: live,
   // });
 
-  const short = await shortlistUniverse(core, {
+  const short = await shortlistFn(core, {
     minPrice: HARD_GATES.minPrice,
     maxSpreadPct: Math.max(HARD_GATES.maxSpreadPct, 0.006),
     preferPositiveGap: true,
@@ -104,6 +112,7 @@ export async function runAutoPick({ debug = false } = {}) {
 
   // Heavy scoring (quotes + ATR)
   const results = await scoreUniverse(short, 5);
+  await attachNewsSignals(results);
 
   const passed = [];
   const failed = [];
@@ -120,7 +129,7 @@ export async function runAutoPick({ debug = false } = {}) {
   }
 
   const ranked = passed.sort(
-    (a, b) => (b.scores?.techTotal || 0) - (a.scores?.techTotal || 0)
+    (a, b) => (b.total ?? b.scores?.techTotal ?? 0) - (a.total ?? a.scores?.techTotal ?? 0)
   );
   const top5 = ranked.slice(0, 5);
   const pick = ranked[0] || null;
@@ -138,7 +147,7 @@ export async function runAutoPick({ debug = false } = {}) {
   await savePick(doc);
 
   if (debug) {
-    doc.considered = results.filter(Boolean).map((r) => ({
+    const considered = results.filter(Boolean).map((r) => ({
       symbol: r.symbol,
       name: r.name,
       last: r.last,
@@ -146,8 +155,15 @@ export async function runAutoPick({ debug = false } = {}) {
       spreadPct: r.spreadPct,
       atrPct: r.atrPct,
       techTotal: r.scores?.techTotal ?? null,
+      newsScore: r.newsScore ?? null,
+      blended: r.total ?? null,
     }));
+    doc.considered = considered;
     doc.filteredOut = failed; // ← see exactly why names failed
+    doc.debug = {
+      considered,
+      rejected: failed,
+    };
   } else {
     doc.considered = short.map((s) => ({ symbol: s.symbol, name: s.name }));
   }
@@ -202,6 +218,7 @@ function gateReasons(r, G, live) {
 }
 
 async function scoreUniverse(list, concurrency = 5) {
+  const getTechScores = useDep("getTechScoresForSymbol");
   const out = [];
   let i = 0;
   async function worker() {
@@ -209,7 +226,7 @@ async function scoreUniverse(list, concurrency = 5) {
       const idx = i++;
       const row = list[idx];
       try {
-        const res = await getTechScoresForSymbol(row);
+        const res = await getTechScores(row);
         if (res) out.push(res);
       } catch {
         // ignore per-symbol errors
@@ -219,9 +236,155 @@ async function scoreUniverse(list, concurrency = 5) {
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
   return out;
 }
+
+async function attachNewsSignals(candidates = []) {
+  if (!Array.isArray(candidates) || candidates.length === 0) return;
+
+  const fetchNewsScores = useDep("getNewsScoresForSymbols");
+  if (typeof fetchNewsScores !== "function") return;
+
+  let raw;
+  try {
+    raw = await fetchNewsScores(candidates.map((x) => x.symbol));
+  } catch (err) {
+    console.warn("[auto-pick] failed to fetch news scores", err);
+    return;
+  }
+
+  let lookup;
+  if (raw instanceof Map) {
+    lookup = raw;
+  } else if (Array.isArray(raw)) {
+    lookup = new Map();
+    for (const item of raw) {
+      const [key, value] = Array.isArray(item)
+        ? [item[0], item[1]]
+        : [item?.symbol ?? item?.ticker ?? item?.id, item];
+      if (!key) continue;
+      lookup.set(key, value);
+    }
+  } else if (raw && typeof raw === "object") {
+    lookup = new Map(Object.entries(raw));
+  } else {
+    lookup = new Map();
+  }
+
+  const weights = POLICY.WEIGHTS || {};
+  const techWeightRaw = Number.isFinite(Number(weights.tech)) ? Number(weights.tech) : 0.7;
+  const newsWeightRaw = Number.isFinite(Number(weights.news)) ? Number(weights.news) : 0.3;
+  const weightSum = techWeightRaw + newsWeightRaw;
+  const techWeight = weightSum > 0 ? techWeightRaw / weightSum : 0.7;
+  const newsWeight = weightSum > 0 ? newsWeightRaw / weightSum : 0.3;
+
+  const gates = POLICY.NEWS_GATES || {};
+  const minScore = Number.isFinite(Number(gates.minScore)) ? Number(gates.minScore) : 0;
+  const minHits = Number.isFinite(Number(gates.minHits)) ? Number(gates.minHits) : 0;
+  const maxAgeMin = Number.isFinite(Number(gates.maxAgeMin))
+    ? Number(gates.maxAgeMin)
+    : Number.POSITIVE_INFINITY;
+
+  for (const row of candidates) {
+    const info = lookup.get(row.symbol) ?? lookup.get(row.symbol?.replace(/^NSE:/, ""));
+
+    const newsScore = clamp01(info?.score ?? info?.newsScore ?? info?.value ?? 0);
+    const newsHits = pickNumber(info?.hits ?? info?.count ?? info?.articles ?? info?.clusters) ?? 0;
+    const newsAgeMin = pickNumber(info?.ageMin ?? info?.ageMinutes ?? info?.age_min);
+    const newsReasons = Array.isArray(info?.reasons)
+      ? info.reasons
+      : info?.reason
+      ? [info.reason]
+      : [];
+
+    const newsQualified =
+      newsScore >= minScore &&
+      newsHits >= minHits &&
+      (newsAgeMin == null || newsAgeMin <= maxAgeMin);
+
+    row.newsScore = newsScore;
+    row.newsHits = newsHits;
+    row.newsAgeMin = newsAgeMin ?? null;
+    row.newsReasons = newsReasons;
+    row.newsQualified = newsQualified;
+
+    const techScore = pickNumber(row.scores?.techTotal ?? row.techScore ?? row.total) ?? 0;
+    row.techScore = techScore;
+
+    row.total = techWeight * techScore + newsWeight * (newsQualified ? newsScore : 0);
+  }
+}
+async function ensureAutoPickIndexes(coll) {
+  if (autoPickIndexesEnsured) return;
+
+  if (typeof coll?.createIndex !== "function") {
+    return;
+  }
+
+  try {
+    if (AUTO_PICK_HISTORY_DAYS > 0) {
+      const expireAfterSeconds = Math.max(1, AUTO_PICK_HISTORY_DAYS * 24 * 3600);
+      await coll.createIndex({ ts: 1 }, { expireAfterSeconds });
+    } else {
+      await coll.createIndex({ ts: 1 });
+    }
+  } catch (err) {
+    console.warn("[auto-pick] failed to ensure index", err);
+  }
+
+  autoPickIndexesEnsured = true;
+}
+
+async function pruneAutoPickHistory(coll) {
+  const ops = [];
+
+  if (AUTO_PICK_HISTORY_DAYS > 0) {
+    if (typeof coll?.deleteMany === "function") {
+      const cutoff = new Date(Date.now() - AUTO_PICK_HISTORY_DAYS * 24 * 3600 * 1000);
+      ops.push(
+        coll.deleteMany({ ts: { $lt: cutoff } }).catch((err) => {
+          console.warn("[auto-pick] failed to prune by age", err);
+        })
+      );
+    }
+  }
+
+  if (AUTO_PICK_MAX_DOCS > 0) {
+    if (
+      typeof coll?.estimatedDocumentCount === "function" &&
+      typeof coll?.find === "function" &&
+      typeof coll?.deleteMany === "function"
+    ) {
+      ops.push(
+        (async () => {
+          const count = await coll.estimatedDocumentCount();
+          if (count <= AUTO_PICK_MAX_DOCS) return;
+
+          const excess = count - AUTO_PICK_MAX_DOCS;
+          const staleIds = await coll
+            .find({}, { projection: { _id: 1 } })
+            .sort({ ts: 1 })
+            .limit(excess)
+            .toArray();
+
+          if (!staleIds.length) return;
+
+          await coll.deleteMany({ _id: { $in: staleIds.map((x) => x._id) } });
+        })().catch((err) => {
+          console.warn("[auto-pick] failed to prune by count", err);
+        })
+      );
+    }
+  }
+
+  await Promise.all(ops);
+}
+
 async function savePick(doc) {
-  const db = await getDb();
-  await db.collection("auto_picks").insertOne(doc); // creates the collection if missing
+  const db = await useDep("getDb")();
+  const coll = db.collection("auto_picks");
+
+  await ensureAutoPickIndexes(coll);
+  await pruneAutoPickHistory(coll);
+  await coll.insertOne(doc); // creates the collection if missing
   console.log("[auto-pick] saved run @", doc.ts.toISOString());
 }
 function clamp01(x) {
@@ -301,6 +464,7 @@ export function __setAutoPickerTestOverrides(map = {}) {
 
 export function __resetAutoPickerTestOverrides() {
   for (const key of Object.keys(overrideDeps)) delete overrideDeps[key];
+  autoPickIndexesEnsured = false;
 }
 
 /** Wrapper class so existing imports keep working */
