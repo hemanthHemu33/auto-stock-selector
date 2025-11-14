@@ -1,6 +1,6 @@
 // src/services/PublishService.js
 import { getDb } from "../db/mongo.js";
-import { AutoPickerService } from "./AutoPickerService.js";
+import { AutoPickerService, isPickForDate } from "./AutoPickerService.js";
 import { isTradingDayIST } from "../utils/holidays.js";
 import { toIST, toISTDateKey } from "../utils/time.js";
 
@@ -45,18 +45,24 @@ export async function publishFinalList({
     return { ok: false, reason: "market_holiday" };
   }
 
+  const todayKey = toISTDateKey(new Date());
   let latest = await AutoPickerService.getLatest?.();
-  if (!latest) {
-    if (typeof AutoPickerService.run === "function") {
-      await AutoPickerService.run({ debug: false });
-    }
+
+  const needsFreshRun =
+    !isPickForDate(latest, todayKey) || (latest?.filteredSize ?? 0) === 0;
+
+  if (needsFreshRun && typeof AutoPickerService.run === "function") {
+    await AutoPickerService.run({ debug: false });
     latest = await AutoPickerService.getLatest?.();
   }
+
   if (!latest) throw new Error("no_pick_available");
+  if (!isPickForDate(latest, todayKey)) {
+    throw new Error("no_pick_for_today");
+  }
 
   const db = await getDb();
-  const dateKey = toISTDateKey(new Date());
-  const _id = `${dateKey}:${source}`;
+  const _id = `${todayKey}:${source}`;
 
   // respect lock unless forced
   const existing = await db.collection("top_stock_symbols").findOne({ _id });
@@ -85,7 +91,7 @@ export async function publishFinalList({
       {
         $set: {
           _id,
-          date: dateKey,
+          date: todayKey,
           createdAtIST: toIST(new Date()),
           source,
           symbols: [],
@@ -109,7 +115,7 @@ export async function publishFinalList({
   ).toISOString();
   const payload = {
     _id,
-    date: dateKey,
+    date: todayKey,
     createdAtIST: toIST(new Date()),
     lockUntil: lockUntilISO,
     source,

@@ -2,7 +2,7 @@
 // Load .env (handled by: node -r dotenv/config ...)
 
 import { connectMongo, closeMongo } from "../src/db/mongo.js";
-import { AutoPickerService } from "../src/services/AutoPickerService.js";
+import { AutoPickerService, isPickForDate } from "../src/services/AutoPickerService.js";
 import { publishFinalList } from "../src/services/PublishService.js";
 import { publishSymbolsToScanner } from "../src/services/StockSymbolsPublisher.js";
 import { toISTDateKey } from "../src/utils/time.js";
@@ -29,10 +29,7 @@ async function main() {
   // 3) Ensure we have a pick for today; if not, create one
   const latest = await AutoPickerService.getLatest();
   const hasToday =
-    latest &&
-    typeof latest.ts === "string" &&
-    latest.ts.slice(0, 10) === todayKey &&
-    (latest.filteredSize ?? 0) > 0;
+    isPickForDate(latest, todayKey) && (latest?.filteredSize ?? 0) > 0;
 
   if (!hasToday) {
     await AutoPickerService.run({ debug: false });
