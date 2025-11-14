@@ -11,6 +11,7 @@ import selectionConfig from "../config/selection.js";
 import { getNewsScoresForSymbols } from "./NewsFactorService.js";
 import { POLICY } from "../config/policy.js";
 import { isMarketOpenIST, minutesSinceOpenIST } from "../utils/marketHours.js";
+import { toISTDateKey } from "../utils/time.js";
 // const HARD_GATES = {
 //   minAvg1mVol: 200000, // liquidity
 //   maxSpreadPct: 0.0035, // 0.35%
@@ -465,6 +466,52 @@ export function __setAutoPickerTestOverrides(map = {}) {
 export function __resetAutoPickerTestOverrides() {
   for (const key of Object.keys(overrideDeps)) delete overrideDeps[key];
   autoPickIndexesEnsured = false;
+}
+
+function parseDate(value) {
+  if (!value) return null;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
+  if (typeof value === "number") {
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  if (typeof value === "string") {
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  return null;
+}
+
+export function pickDocDateKey(doc) {
+  if (!doc || typeof doc !== "object") return null;
+
+  const candidates = [
+    parseDate(doc.ts),
+    parseDate(doc.createdAt),
+    parseDate(doc.created_at),
+    parseDate(doc.date),
+    parseDate(doc.dateIST),
+    parseDate(doc.builtAtIST),
+  ];
+
+  for (const d of candidates) {
+    if (d) return toISTDateKey(d);
+  }
+
+  const fallbackKeys = [doc.date, doc.dateIST, doc.day];
+  for (const key of fallbackKeys) {
+    if (typeof key === "string" && /^\d{4}-\d{2}-\d{2}$/.test(key)) {
+      return key;
+    }
+  }
+
+  return null;
+}
+
+export function isPickForDate(doc, dateKey = toISTDateKey()) {
+  if (!dateKey) return false;
+  const docKey = pickDocDateKey(doc);
+  return docKey === dateKey;
 }
 
 /** Wrapper class so existing imports keep working */
