@@ -12,7 +12,7 @@ import { runAutoPick } from "../services/AutoPickerService.js";
 import { getDb } from "../db/mongo.js";
 import { publishFinalList } from "../services/PublishService.js";
 import { appendToStockSymbols } from "../services/StockSymbolsService.js";
-const TOP_N = Number(process.env.AUTO_PUBLISH_TOP_N || 30);
+const TOP_N = Number(process.env.AUTO_PUBLISH_TOP_N || 15);
 const DEFAULT_SOURCE = "preopen";
 
 export function istNow() {
